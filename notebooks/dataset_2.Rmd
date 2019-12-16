@@ -1,0 +1,828 @@
+---
+title: "Identification of influenza biomarkers from transcriptomics data"
+author: 
+  - Diogo M. Camacho
+  - Miguel A. Alcantar
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    df_print: paged
+subtitle: 'Dataset: 2019-08'
+abstract: Here we will be exploring data set for the flu project (a collaboration
+  with the Ingber lab). The data corresponds to an analyses of transcriptomics data
+  collected from one healthy donor lung cells, with cells being cultured in transwells
+  (no endothelial cells.) Additionally, we will be looking at publicly available data
+  for identification of potential host biomarkers for influenza infection. RNA-seq
+  data was collected by the DFCI transcriptomics core.
+---
+
+```{r libsfun, echo = FALSE, include=FALSE}
+# libraries
+library(tidyverse)
+library(readr)
+library(readxl)
+library(DRUID)
+library(grove)
+library(DESeq2)
+library(org.Hs.eg.db)
+library(rpegeos)
+library(diffnet)
+library(plotly)
+library(igraph)
+library(ggraph)
+
+# functions
+source(here::here("R/stouffer_specificity.R"))
+#source("R/limma_dge.R")
+
+load_data<- function() {
+  # load raw metadata
+  metadata_raw_copd_nhb <- readxl::read_xlsx(here::here("data/RNA-seq_data_chip/COPD_NHB_data/RNAseq_NHB_COPD_metadata_new.xlsx"))
+  
+  # function that will help create new column names with form condition#_time_donorID
+  reorder_names <- function(x)
+  {
+    x_split <- unlist(strsplit(x, " "))
+    x_len <- length(x_split)
+    
+    if(length(x_split[1:(x_len-2)]) > 1)
+    {
+      return(paste(x_split[x_len], x_split[(x_len-1)], x_split[1], x_split[2], sep="_"))
+    }
+    else
+    {
+      return(paste(x_split[x_len], x_split[(x_len-1)], x_split[1], sep="_"))
+    }
+  }
+  
+  # create final metadata csv file
+  new_sample_names <-unlist(lapply(metadata_raw_copd_nhb$sample_name, reorder_names))
+  metadata_copd_nhb <- metadata_raw_copd_nhb %>% 
+    dplyr::mutate(., new_sample_names = new_sample_names,
+                  group_time = paste(group, time, sep = "_"),
+                  condition_time = paste(condition, time, sep = "_"),
+                  condition_group = paste(condition, group, sep = "_"),
+                  condition_group_time = paste(condition, group, time, sep="_"))
+
+  # uncomment if you want to save new csv file
+  # write_csv(metadata_copd_nhb, "../../../data/RNA-seq_data_chip/COPD_NHB_data/metadata_copd_nhb.csv")
+  
+  # load in count data and extract gene IDs
+  count_data <- read_csv(here::here("data/RNA-seq_data_chip/COPD_NHB_data/RP7193_hg19_STAR_raw_gene_counts.csv"))
+  gene_ids <- count_data$Gene_ID
+  count_data <- count_data %>% dplyr::select(., -Gene_ID)
+  
+  # drop well that did not run in RNA seq pipeline
+  count_data <- count_data[,!names(count_data) %in% 's2-G3']
+  metadata_copd_nhb <- metadata_copd_nhb[!metadata_copd_nhb$well_name %in% 's2-G3',]
+  
+  # changing order of metadata so it matches count_data
+  # essentially, match finds the indices that match the order of the first argument, 
+  # we are then indexing metadata with these new indices such that the order matches
+  metadata_copd_nhb <- metadata_copd_nhb[match(colnames(count_data), metadata_copd_nhb$well_name), ]
+
+  # conditions we want to compare
+  data_to_return <- list("count_data" = count_data, "metadata" = metadata_copd_nhb, "gene_ids" = gene_ids)
+  
+  return(data_to_return)
+  
+}
+
+
+preprocess_data <- function(count_data, gene_ids, org.Hs.eg.db, freq_thresh = 0.75) {
+  
+  nix <- which(rowSums(count_data) == 0) #find index of rows with all 0s
+  gene_ids_starting <- gene_ids
+  # remove gene ids that match with rows that contain all 0s
+  if(length(nix) != 0) {
+    gene_ids <- gene_ids[-nix]
+    count_data <- count_data[-nix, ]
+  }
+  
+  # remove gene ids with multiple entrez mappings
+  gkey <- AnnotationDbi::select(x = org.Hs.eg.db, 
+                                keys = gene_ids, 
+                                columns = "ENTREZID", 
+                                keytype = "SYMBOL")
+  
+  # this basically looks for which genes appear more than once (i.e., have more than one entrez ID per gene ID)
+  nix <- which(sapply(gene_ids, function(y) length(which(gkey$SYMBOL == y))) != 1)
+  if(length(nix) != 0) {
+    gene_ids <- gene_ids[-nix]
+    count_data <- count_data[-nix, ]
+  }
+  
+  # remove genes with NA entrez id
+  gkey <- AnnotationDbi::select(x = org.Hs.eg.db, 
+                                keys = gene_ids, 
+                                columns = "ENTREZID", 
+                                keytype = "SYMBOL")
+  
+  nix <- which(is.na(gkey$ENTREZID))
+  if(length(nix) != 0) {
+    gene_ids <- gene_ids[-nix]
+    count_data <- count_data[-nix, ]
+  }
+  
+  # frequency across samples
+  # minimum 5 read counts, at least in 75% of the samples
+  x1 <- apply(count_data, 1, function(y) length(which(y >= 5)))
+  x1 <- which(x1 >= round(freq_thresh * ncol(count_data)))
+  
+  count_data <- count_data[x1, ]
+  gene_ids <- gene_ids[x1]
+  genes_filtered<- setdiff(gene_ids_starting, gene_ids)
+  
+  data_to_return <- list("count_data" = count_data, "gene_ids" = gene_ids, "genes_filtered" = genes_filtered)
+  return(data_to_return)
+}
+```
+
+
+# Load data
+```{r load_data}
+# load data
+flu_data <- load_data()
+
+```
+
+
+# Processing data 
+Here we will perform a set of data clean up steps. These will include:
+
+ - removing probes that show zero counts across all samples
+ - remove genes with multiple EntrezIDs (I consider these to be poor mappings -- non-specific)
+ - remove genes with NA entrez ids (can't map these to pathways/processes)
+
+```{r process_data}
+
+count_data <- flu_data$count_data
+gene_ids <- flu_data$gene_ids
+sample_data <- flu_data$metadata
+
+# remove gene ids with multiple entrez mappings
+gkey <- AnnotationDbi::select(x = org.Hs.eg.db, 
+                              keys = gene_ids, 
+                              columns = "ENTREZID", 
+                              keytype = "SYMBOL")
+  
+# this basically looks for which genes appear more than once (i.e., have more than one entrez ID per gene ID)
+nix <- names(which(sapply(gene_ids, function(y) length(which(gkey$SYMBOL == y))) != 1))
+
+if(length(nix) != 0) {
+  for (i in seq(1, length(nix))) {
+    a1 <- which(gkey$SYMBOL == nix[i])  
+    a2 <- which.max(diag(var(t(as.matrix(count_data[a1, ])))))
+    a3 <- a1[setdiff(seq(1, length(a1)), a2)]
+    count_data[a3, ] <- 0
+  }
+}
+
+
+# find genes with no counts across all samples
+nix <- which(rowSums(count_data) == 0)
+
+if(length(nix) != 0) {
+  gene_ids <- gene_ids[-nix]
+  count_data <- count_data[-nix, ]
+}
+ 
+
+# get annotations
+gkey <- AnnotationDbi::mapIds(x = org.Hs.eg.db, 
+                                keys = gene_ids, 
+                                column = "ENTREZID",
+                                keytype = "SYMBOL")
+
+gene_df <- tibble::tibble(gene_symbol = gene_ids,
+                          entrez_id = gkey)
+  
+# remove genes with NA entrez id
+nix <- which(is.na(gene_df$entrez_id))
+if(length(nix) != 0) {
+  gene_df <- gene_df[-nix, ]
+  count_data <- count_data[-nix, ]
+}  
+  
+# frequency across samples
+# minimum 5 read counts, at least in 75% of the samples
+x1 <- apply(count_data, 1, function(y) length(which(y >= 5)))
+x1 <- which(x1 >= round(0.75 * ncol(count_data)))
+  
+count_data <- count_data[x1, ]
+gene_df <- gene_df[x1, ]
+```
+
+# Visualizing data 
+We will use UMAP for the visualization of the count data.
+
+```{r umap}
+
+tmp_data <- t(count_data)
+X <- umap::umap(tmp_data)
+
+Y <- tibble::tibble(x = X$layout[, 1],
+                    y = X$layout[, 2],
+                    condition = sample_data$condition,
+                    time_point = sample_data$time,
+                    disp_id = sample_data$condition_group_time)
+
+p <- Y %>%
+  ggplot() + 
+  geom_point(aes(x = x, y = y, color = disp_id), size = 4, alpha = 0.5) +
+  # scale_color_viridis_d() +
+  labs(x = "Dimension 1", y = "Dimension 2") + 
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 12, color = "black"),
+        axis.ticks.length = unit(0.2, "cm"))
+ggsave(plot = p, 
+       filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_UMAP-samples.tiff")), 
+       device = "tiff", 
+       width = 11, 
+       height = 8, 
+       dpi = 600)
+
+p
+
+```
+
+
+
+# Differential expression
+With the data processed as described in the steps above, we can now proceed with standard analyses such as calculating the differential expression for the genes given the conditions we have. For the differential expression we will use the `DESeq2` package, as this is the state-of-the-art tool for differential analyses of RNA-seq data. 
+
+```{r deseq2}
+dds_copd_nhb <- DESeqDataSetFromMatrix(countData = count_data,
+                                   colData = sample_data,
+                                   design = ~ condition_group_time)
+
+dds_copd_nhb <- DESeq(object = dds_copd_nhb)
+counts_normalized <- counts(dds_copd_nhb, 
+                            normalized = TRUE) # normalize counts using sizeFactor; useful for GSEA_GAGE
+```
+
+This establishes the `DESeq2` object that we can now query with different contrasts. For the purpose here we will perform the following comparisons:
+
+ - COPD vs normal, controls, 4h
+ - COPD vs normal, controls, 18h
+ - COPD infected vs COPD control, 4h
+ - COPD infected vs COPD control, 18h
+ - Normal infected vs normal control, 4h
+ - Normal infected vs normal control, 18h
+ - COPD infected vs normal infected, 4h
+ - COPD infected vs normal infected, 18h
+ - COPD poly IC vs COPD control, 18h
+ - Normal poly IC vs normal control, 18h
+ 
+
+```{r dge_comparisons}
+contrast_groups <- tibble::tibble(id = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+                                  nid = c("copd_nhb_ctr_4",
+                                          "copd_infected_4",
+                                          "nhb_infected_4",
+                                          "copd_nhb_infected_4",
+                                          "copd_nhb_ctr_18",
+                                          "copd_infected_18",
+                                          "nhb_infected_18",
+                                          "copd_nhb_infected_18",
+                                          "nhb_polyic_18",
+                                          "copd_polyic_18"),
+                                  name = c("COPD control vs NHB control",
+                                           "COPD infected vs COPD control",
+                                           "NHB infected vs NHB control",
+                                           "COPD infected vs NHB infected",
+                                           "COPD control vs NHB control",
+                                           "COPD infected vs COPD control",
+                                           "NHB infected vs NHB control",
+                                           "COPD infected vs NHB infected",
+                                           "NHB PolyIC vs NHB control",
+                                           "COPD PolyIC vs COPD control"),
+                                  time_point = c(4, 4, 4, 4, 18, 18, 18, 18, 18, 18),
+                                  virus = c(0, 1, 1, 1, 0, 1, 1, 1, 0, 0),
+                                  polyic = c(0, 0, 0, 0, 0, 0, 0, 0, 1, 1),
+                                  var1 = c("COPD_control_4",
+                                           "COPD_virus_4",
+                                           "NHB_virus_4",
+                                           "COPD_virus_4",
+                                           "COPD_control_18",
+                                           "COPD_virus_18",
+                                           "NHB_virus_18",
+                                           "COPD_virus_18",
+                                           "NHB_poly_ic_18",
+                                           "COPD_poly_ic_18"),
+                                  var2 = c("NHB_control_4",
+                                           "COPD_control_4",
+                                           "NHB_control_4",
+                                           "NHB_virus_4",
+                                           "NHB_control_18",
+                                           "COPD_control_18",
+                                           "NHB_control_18",
+                                           "NHB_virus_18",
+                                           "NHB_control_18",
+                                           "COPD_control_18"),
+                                  deseq_name = rep("condition_group_time", 10))
+
+
+deseq_res <- vector(mode = "list", length = nrow(contrast_groups))
+for (i in seq(1, length(deseq_res))) {
+  
+  cont <- c(contrast_groups$deseq_name[i], 
+            contrast_groups$var1[i],
+            contrast_groups$var2[i])
+  
+  res <- results(dds_copd_nhb,
+                 contrast = cont,
+                 pAdjustMethod = "fdr",
+                 cooksCutoff = FALSE)
+  
+  deseq_res[[i]] <- res %>%
+    as_tibble() %>%
+    dplyr::select(., baseMean, log2FoldChange, padj) %>%
+    tibble::add_column(., comparison_id = contrast_groups$id[i]) %>%
+    tibble::add_column(., comparison_nid = contrast_groups$nid[i]) %>%
+    tibble::add_column(., comparison_name = contrast_groups$name[i]) %>%
+    tibble::add_column(., time_point = contrast_groups$time_point[i]) %>%
+    tibble::add_column(., virus = contrast_groups$virus[i]) %>%
+    tibble::add_column(., poluy_ic = contrast_groups$polyic[i]) %>%
+    tibble::add_column(., gene_symbol = gene_df$gene_symbol) %>%
+    tibble::add_column(., entrez_id = gene_df$entrez_id)
+}
+deseq_res <- dplyr::bind_rows(deseq_res)
+
+deseq_res %>% tibble::add_column(., sig = 0) %>% dplyr::mutate(., sig = replace(sig, abs(log2FoldChange) > 1 & padj < 0.01, 1))
+```
+
+We can look at what these comparisons look like using an MA-plot or a volcano plot:
+
+```{r volcano_plots, plotly = TRUE}
+p1 <- deseq_res %>% 
+  tibble::add_column(., sig = 0) %>% 
+  dplyr::mutate(., sig = replace(sig, abs(log2FoldChange) > 1 & padj < 0.01, 1)) %>%
+  ggplot() + 
+  geom_point(aes(y = log2FoldChange, x = log10(baseMean), color = as.factor(sig), gene = gene_symbol, entrez = entrez_id, fold_change = log2FoldChange, base_mean = log10(baseMean)), alpha = 0.5, size = 3) + 
+  # ylim(c(-max(abs(res_v18$log2FoldChange)), max(abs(res_v18$log2FoldChange)))) +
+  # scale_color_viridis_d() +
+  scale_color_manual(breaks = c(0, 1), name = NULL, values = c("black", "red"), labels = c("Not significant", "|F| > 1, p < 0.01")) +
+  labs(y = "log(fold change)", x = "Mean normalized counts", title = "MA plot") + 
+  facet_grid(time_point ~ comparison_name) +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 12, color = "black"),
+        axis.ticks.length = unit(0.2, "cm"),
+        strip.text = element_text(size = 12, color = "black"),
+        legend.position = "top")
+ggsave(plot = p1, filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_MAplot.tiff")), device = "tiff", width = 11, height = 8, dpi = 600)
+
+p2 <- deseq_res %>% 
+  tibble::add_column(., sig = 0) %>% 
+  dplyr::mutate(., sig = replace(sig, abs(log2FoldChange) > 1 & padj < 0.01, 1)) %>%
+  ggplot() + 
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), color = as.factor(sig), gene = gene_symbol, entrez = entrez_id, fold_change = log2FoldChange, padj = -log10(padj)), alpha = 0.5, size = 3) + 
+  # ylim(c(0, max(-log10(res_v18$padj)))) +
+  # xlim(c(-max(abs(res_v18$log2FoldChange)), max(abs(res_v18$log2FoldChange)))) +
+  # scale_color_viridis_d() +
+  scale_color_manual(breaks = c(0, 1), name = NULL, values = c("black", "red"), labels = c("Not significant", "|F| > 1, p < 0.01")) +
+  labs(y = "log(fold change)", x = "Mean normalized counts", title = "Volcano plot") + 
+  facet_grid(time_point ~ comparison_name) +
+  theme_bw() + 
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 12, color = "black"),
+        axis.ticks.length = unit(0.2, "cm"),
+        strip.text = element_text(size = 8, color = "black"),
+        legend.position = "top")
+ggsave(plot = p2, 
+       filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_volcano-plot.tiff")), 
+       device = "tiff", 
+       width = 11, 
+       height = 8, 
+       dpi = 600)
+
+p1
+
+p2
+
+# # now interactive plots
+# plotly::ggplotly(p1, tooltip = c("gene", "entrez_id", "fold_change", "base_mean"))
+# 
+# plotly::ggplotly(p2, tooltip = c("gene", "entrez_id", "fold_change", "padj"))
+```
+
+
+From these plots we see that the infection with influenza virus only shows effect at the transcriptional levels at 18h, unless we are comparing healthy and diseased individuals. For that reason, I will focus the remainder of the study on the effects of the virus at the 18h time point.
+
+# Transcriptional signature for COPD donors
+Before that, though, we can define the transcriptional signature for COPD, when compared with healthy donors. This corresponds to the `COPD control vs NHB control` plots shown above.
+
+```{r copd_disease_signature}
+# subset data
+copd_sig <- deseq_res %>%
+  dplyr::filter(., comparison_nid == "copd_nhb_ctr_4" | comparison_nid == "copd_nhb_ctr_18")
+
+copd_4 <- copd_sig %>% 
+  dplyr::filter(., time_point == 4)
+
+copd_18 <- copd_sig %>% 
+  dplyr::filter(., time_point == 18)
+
+```
+
+From these analyses we get that there are `r copd_4 %>% dplyr::filter(., abs(log2FoldChange) > 1, padj < 0.05) %>% nrow()` genes that are differentially expressed at 4h and `r copd_18 %>% dplyr::filter(., abs(log2FoldChange) > 1, padj < 0.05) %>% nrow()` genes that are differentially expressed at 18h. 
+
+## DRUID on COPD: compounds to ameliorate the **disease**
+Based on these results, it is conceivable that we can identify chemical compounds for COPD therapeutics, generally speaking. Though not the focus of this work, we will run thes analyses using DRUID on both the 4h and the 18h time points.
+
+```{r copd_druid_disease}
+a1 <- copd_4 %>% 
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+a2 <- copd_18 %>% 
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+# druid parameters
+res <- vector(mode = "list", length = 5)
+for (i in seq(1, 5)) {
+      res[[i]] <- DRUID::run_druid(dge_matrix = as.matrix(a1[, c(2, 3)]), 
+                            druid_direction = "neg", 
+                            fold_thr = 0, 
+                            pvalue_thr = 0.05, 
+                            entrez = as.matrix(a1[, 1]), 
+                            num_random = 10000, 
+                            selection = i)
+}
+copd_druid_4 <- dplyr::bind_rows(res)
+rm(res)
+
+res <- vector(mode = "list", length = 5)
+for (i in seq(1, 5)) {
+      res[[i]] <- DRUID::run_druid(dge_matrix = as.matrix(a2[, c(2, 3)]), 
+                            druid_direction = "neg", 
+                            fold_thr = 0, 
+                            pvalue_thr = 0.05, 
+                            entrez = as.matrix(a2[, 1]), 
+                            num_random = 10000, 
+                            selection = i)
+}
+copd_druid_18 <- dplyr::bind_rows(res)
+rm(res)
+```
+
+From these results we can explore compounds that could be relevant in the treatment of COPD as a whole. Taking the results at the 4h and 18h time points, we can find commonalities in the identified compounds.
+
+```{r copd_druid_common}
+a1 <- copd_druid_4 %>% dplyr::arrange(., desc(druid_score)) %>% dplyr::slice(1:100)
+a2 <- copd_druid_18 %>% dplyr::arrange(., desc(druid_score)) %>% dplyr::slice(1:100)
+a3 <- sort(intersect(a1$drug_name, a2$drug_name))
+a3
+```
+
+
+# Host-tolerance promoters
+Going back to the focus of this work, we will go through the transcriptomics data to make predictions on sets of compounds that can be used to improve the reponse of a host to influenza infection, using our algorithm DRUID.
+
+
+```{r druid_copd_infection}
+a1 <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "copd_infected_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+nix <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "copd_polyic_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+a1 <- a1[-which(a1$entrez_id %in% nix$entrez_id), ]
+
+# druid parameters
+res <- vector(mode = "list", length = 5)
+for (i in seq(1, 5)) {
+      res[[i]] <- DRUID::run_druid(dge_matrix = as.matrix(a1[, c(2, 3)]), 
+                            druid_direction = "neg", 
+                            fold_thr = 0, 
+                            pvalue_thr = 0.05, 
+                            entrez = as.matrix(a1[, 1]), 
+                            num_random = 10000, 
+                            selection = i)
+}
+copd_druid_18 <- dplyr::bind_rows(res)
+rm(res)
+
+copd_druid_18 %>% 
+  dplyr::select(., -data_source, -cosine_similarity, -probability_random, -number_matches) %>%
+  dplyr::arrange(desc(druid_score))
+```
+
+With these results in hand, we can now look at the effect of influenza virus on normal donors doing the same analyses:
+
+```{r}
+a1 <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "nhb_infected_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+nix <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "nhb_polyic_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+a1 <- a1[-which(a1$entrez_id %in% nix$entrez_id), ]
+
+# druid parameters
+res <- vector(mode = "list", length = 5)
+for (i in seq(1, 5)) {
+      res[[i]] <- DRUID::run_druid(dge_matrix = as.matrix(a1[, c(2, 3)]), 
+                            druid_direction = "neg", 
+                            fold_thr = 0, 
+                            pvalue_thr = 0.05, 
+                            entrez = as.matrix(a1[, 1]), 
+                            num_random = 10000, 
+                            selection = i)
+}
+nhb_druid_18 <- dplyr::bind_rows(res)
+rm(res)
+
+nhb_druid_18 %>% 
+  dplyr::select(., -data_source, -cosine_similarity, -probability_random, -number_matches) %>%
+  dplyr::arrange(desc(druid_score))
+```
+
+
+We can visualize these results in both donor classes easily:
+
+```{r}
+
+a1 <- copd_druid_18 %>% 
+  dplyr::arrange(desc(druid_score)) %>%
+  dplyr::slice(1:20) %>%
+  dplyr::mutate(., comp = "copd")
+
+a2 <- nhb_druid_18 %>% 
+  dplyr::arrange(desc(druid_score)) %>%
+  dplyr::slice(1:20) %>%
+  dplyr::mutate(., comp = "nhb")
+
+# a3 <- copd_nhb_druid_18 %>%
+#   dplyr::arrange(desc(druid_score)) %>%
+#   dplyr::slice(1:20) %>%
+#   dplyr::mutate(., comp = "copd_nhb")
+
+druid_res_1 <- dplyr::bind_rows(a1, a2)
+
+p2 <- druid_res_1 %>%
+  ggplot() + 
+  geom_point(aes(x = druid_score, y = drug_name, color = comp), size = 4, alpha = 0.5) +
+  scale_color_viridis_d() + 
+  labs(x = "DRUID score", y = NULL) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12, color = "black"),
+        axis.text.x = element_blank(),
+        axis.title.y = element_blank())
+ggsave(plot = p2, 
+       filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_DRUID-RESULTS-2class.tiff")), 
+       device = "tiff", 
+       width = 11, 
+       height = 8, 
+       dpi = 600)
+
+p2
+
+
+druid_res_1 %>% 
+  dplyr::select(., -data_source, -cosine_similarity, -probability_random, -number_matches) %>%
+  dplyr::arrange(desc(druid_score))
+```
+
+# Viral specific expression changes
+Because we have 2 distinct donor populations that we have infected with influenza virus, we can use the differential expression data to identify potential host biomarkers for influenza infection. 
+
+```{r}
+
+a1 <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "nhb_infected_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+nix <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "nhb_polyic_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+a1 <- a1[-which(a1$entrez_id %in% nix$entrez_id), ]
+
+
+a2 <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "copd_infected_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+nix <- deseq_res %>% 
+  dplyr::filter(., comparison_nid == "copd_polyic_18") %>%
+  dplyr::filter(., padj < 0.05, abs(log2FoldChange) > 1) %>%
+  dplyr::select(., entrez_id, log2FoldChange, padj)
+
+a2 <- a2[-which(a2$entrez_id %in% nix$entrez_id), ]
+
+a3 <- union(a2$entrez_id, a1$entrez_id)
+
+a1 <- a1[which(a1$entrez_id %in% a3), ] %>% 
+  dplyr::mutate(., group = "nhb_infected_18")
+a2 <- a2[which(a2$entrez_id %in% a3), ] %>%
+  dplyr::mutate(., group = "copd_infected_18")
+
+virus_specific <- dplyr::bind_rows(a1, a2)
+
+virus_specific <- virus_specific %>%
+  dplyr::mutate(., symbol = AnnotationDbi::mapIds(x = org.Hs.eg.db, keys = virus_specific$entrez_id, column = "SYMBOL", keytype = "ENTREZID")) %>% 
+  dplyr::mutate(., description = AnnotationDbi::mapIds(x = org.Hs.eg.db, keys = virus_specific$entrez_id, column = "GENENAME", keytype = "ENTREZID"))
+
+virus_specific
+
+```
+
+All these genes constitute genes that are differentially expressed in either COPD or normal donors when exposed to influenza infection. We can visualize what the expression of these genes looks like in the different conditions.
+
+```{r}
+# a1 <- count_data[which(gene_df$entrez_id %in% virus_specific$entrez_id), ]
+# a2 <- sample_data %>% dplyr::filter(., time == 18)
+# a3 <- which(colnames(a1) %in% a2$well_name)
+# a1 <- a1[, a3]
+# # a1 <- scale(a1)
+# 
+# specific_expression <- tibble::tibble(gene = rep(virus_specific$symbol, ncol(a1)),
+#                                       counts = as.vector(as.matrix(a1)),
+#                                       condition = as.vector(sapply(a2$condition, function(x) rep(x, length(virus_specific$entrez_id)))),
+#                                       group = as.vector(sapply(a2$group, function(x) rep(x, length(virus_specific$entrez_id)))),
+#                                       condition_group = as.vector(sapply(a2$condition_group, function(x) rep(x, length(virus_specific$entrez_id)))))
+# 
+# 
+# p2 <- specific_expression %>% 
+#   ggplot() + 
+#   geom_boxplot(aes(x = gene, y = counts, fill = condition)) + 
+#   scale_fill_viridis_d() + 
+#   facet_grid(group ~ .) +
+#   theme_bw() +
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+# ggsave(plot = p2, 
+#        filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_VIRUS-SPECIFIC-GENES.tiff")), 
+#        device = "tiff", 
+#        width = 11, 
+#        height = 8, 
+#        dpi = 600)
+
+p2 <- virus_specific %>%
+  ggplot() +
+  geom_point(aes(x = forcats::fct_reorder(symbol, log2FoldChange, .desc = TRUE), y = log2FoldChange, color = group), size = 4, alpha = 0.5) +
+  scale_color_viridis_d() + 
+  # facet_grid(. ~ group) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave(plot = p2,
+       filename = here::here(paste0("res/dataset_2/", format(Sys.Date(), "%Y-%m-%d"), "_VIRUS-SPECIFIC-GENES.tiff")),
+       device = "tiff",
+       width = 11,
+       height = 8,
+       dpi = 600)
+  
+p2
+
+```
+
+
+## Secreted biomarkers
+Building on what have done before, we can use these data on genes that show specificity to influenza infection to identify genes that encode secreted proteins.
+
+```{r secreted_biomarkers}
+# signal peptides ----
+sig_pep <- read_xlsx(here::here("data/secretome/2019-03-07_signal_peptides_human.xlsx"))
+
+sig_peps_names <- AnnotationDbi::select(x = org.Hs.eg.db, 
+                                        keys = as.character(sig_pep$`Accession Number`),
+                                        keytype = "UNIPROT", columns = c("ENTREZID", "SYMBOL")) %>% 
+  as_tibble() %>% 
+  dplyr::filter(., !is.na(ENTREZID))
+
+
+# secreted proteins ----
+# based on HPA predicted data
+hpa_pred <- read_delim(here::here("data/secretome/2019-03-07_HPA_predicted_secreted_proteins.tsv"), delim = "\t")
+
+hpa_pred <- tibble::tibble(gene = hpa_pred$Gene,
+                           synonym = hpa_pred$`Gene synonym`,
+                           description = tolower(hpa_pred$`Gene description`),
+                           class = tolower(hpa_pred$`Protein class`), 
+                           evidence = tolower(hpa_pred$Evidence),
+                           antibody = hpa_pred$Antibody,
+                           subcellular = hpa_pred$`Subcellular location`) %>%
+  dplyr::filter(., grepl(pattern = "protein level", evidence))
+
+# predicted secreted biomarkers ----
+# virus_biom_sec <- union(virus_secp, virus_sig_peps)
+virus_biomarkers <- virus_specific %>% 
+  tibble::add_column(., signal_peptide = 0) %>% 
+  tibble::add_column(., secreted = 0) %>%
+  tibble::add_column(., lung_specific = 0) %>%
+  dplyr::mutate(., signal_peptide = replace(signal_peptide, which(symbol %in% sig_peps_names$SYMBOL), 1)) %>% 
+  dplyr::mutate(., secreted = replace(secreted, which(symbol %in% hpa_pred$gene), 1))
+
+# plot ----
+dev <- "tiff"
+p1 <- virus_biomarkers %>% 
+  dplyr::filter(., signal_peptide == 1 | secreted == 1) %>%
+  ggplot() + 
+  geom_point(aes(x = forcats::fct_reorder(symbol, log2FoldChange, .desc = TRUE), y = log2FoldChange, color = log2FoldChange), alpha = 0.5, size = 4) + 
+  scale_color_viridis_c() + 
+  facet_grid(. ~ group) +
+  labs(x = NULL, y = "log2(Fold change)", title = "Secreted proteins") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12, color = "black"),
+        axis.text.y = element_text(size = 12, color = "black"),
+        axis.title = element_text(size = 24, color = "black"))
+ggsave(plot = p1, 
+       filename = here::here(paste0("res/dataset_2/", Sys.Date(),"_virus-specific-SECRETED-biomarkers.", dev)),
+       device = dev, 
+       width = 11, 
+       height = 8, 
+       dpi = 600)
+
+
+p1
+
+
+```
+
+
+# Tissue specificity
+Additionally, we can use publicly available data to assess which genes are preferentially expressed in a given tissue. For this particular problem, we are interested in identifying the genes that are mostly expressed in lung. For that, we will use the human expression atlas data that is housed at [BioGPS](http://www.biogps.org). We can also use data from [GTex](https://www.gtexportal.org/home/), though this is not implemented yet (will include this in future work.)
+
+The tissue specificity is calculated using an adaptation of Stouffer's method. Briefly, we normalize the expression data along the gene **and** the sample spaces, independently, and we combine the normalized scores into a single representation given by:
+
+$ Z_{global} = \frac{Z_{genes} + Z_{samples}}{\sqrt(2)} $
+
+where $Z_{global}$ is the tissue specificity score, $Z_{genes}$ corresponds to the normalized data along the gene space (normalizing along the columns), and $Z_{samples}$ is the normalized data along the sample space (normalizing along the rows). 
+
+First, we will compute the average expression of any given gene for any given tissue. 
+
+```{r average_tissue_expression}
+# biogps data ----
+load(here::here("data/2019-02-13_biogps.RData"))
+
+
+# average of tissues ----
+utis <- unique(biogps_data$tissues)
+avg_E <- matrix(0, nrow = nrow(biogps_data$expression), ncol = length(utis))
+for (i in seq(1, length(utis))) {
+  u1 <- which(biogps_data$tissues == utis[i])
+  if (length(u1) > 1) {
+    avg_E[, i] <- rowMeans(biogps_data$expression[, u1])
+  } else {
+    avg_E[, i] <- biogps_data$expression[, u1]
+  }
+}
+
+```
+
+
+With these data we can now computer the tissue specificity:
+
+```{r stouffer_specificity}
+# lung specific genes ----
+stouf_thr <- 3
+ts_stouffer <- stouffer_specificity(avg_E)
+```
+
+As we can see, the dimensions of the (average) expression matrix (ncols = `r ncol(avg_E)`; nrows = `r nrow(avg_E)`) and the tissue specificity matrix (ncols = `r ncol(ts_stouffer)`; nrows = `r nrow(ts_stouffer)`) are exactly the same, which is what we wanted. 
+
+## Lung specific genes
+Using the transformation above, we will look for genes that are primarily expressed in the lung. 
+
+```{r lung_specific, cache=FALSE}
+B <- ts_stouffer
+B[which(B < stouf_thr)] <- 0
+B[B != 0] <- 1
+
+num_tissues <- rowSums(B)
+
+spec_genes <- which(num_tissues <= 2 & num_tissues != 0) # <-- gives at most 2 tissues with high specificity for a given gene
+
+# now make a data frame for these:
+specificity_df <- tibble::tibble(gene_symbol = rep(biogps_data$genes$SYMBOL[spec_genes], length(utis)),
+                                 entrez_id = rep(biogps_data$genes$ENTREZID[spec_genes], length(utis)),
+                                 tissue_name = as.vector(sapply(utis, rep, length(spec_genes))),
+                                 presence_call = as.vector(B[spec_genes, ]))
+
+specificity_df <- specificity_df %>%
+  dplyr::filter(., presence_call != 0)
+
+lung_genes <- specificity_df %>%
+  dplyr::filter(., tissue_name == "lung") %>%
+  dplyr::select(., -presence_call)
+
+lung_genes
+```
+
+Looking at our data set we can see that there are `r length(intersect(virus_specific$symbol, lung_genes$gene_symbol))` genes that are lung specific and differentially expressed in our experiments. These are `r intersect(virus_specific$symbol, lung_genes$gene_symbol)`.
+
