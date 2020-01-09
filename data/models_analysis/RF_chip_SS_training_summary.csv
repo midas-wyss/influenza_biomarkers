@@ -1,0 +1,2 @@
+,roc_auc_ci,roc_auc_median,fpr,tpr,AP_ci,AP_median,precision,recall,accuracy_ci,accuracy_median
+0,[1. 1.],1.0,[0. 0. 1.],[0. 1. 1.],[1. 1.],1.0,[1. 1.],[1. 0.],[1. 1.],1.0

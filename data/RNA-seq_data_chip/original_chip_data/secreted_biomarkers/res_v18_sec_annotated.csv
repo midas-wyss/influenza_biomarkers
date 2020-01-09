@@ -1,0 +1,14 @@
+,gene,baseMean,log2FoldChange,lfcSE,stat,pvalue,padj,annotation,secreted
+1,TLR3,1083.299368,1.021554478,0.155340428,6.576230597,4.83E-11,2.22E-09,toll like receptor 3,"Intracellular,Membrane"
+2,IL1RN,2602.479933,1.148570466,0.128032307,8.970942529,2.94E-19,2.36E-17,interleukin 1 receptor antagonist,"Intracellular,Secreted"
+3,CFB,23193.63379,1.038862003,0.144632414,7.182774424,6.83E-13,3.68E-11,complement factor B,"Intracellular,Secreted"
+4,SECTM1,3488.667768,1.584027956,0.144014801,10.9990636,3.86E-28,4.37E-26,secreted and transmembrane 1,secreted + membrane
+5,TOR1B,1445.897506,1.844749311,0.118774851,15.53148069,2.12E-54,4.41E-52,torsin family 1 member B,endoplasmic reticulum and nuclear envelope
+6,MMP13,745.7594561,1.531495699,0.31402709,4.876954089,1.08E-06,2.75E-05,matrix metallopeptidase 13,secreted
+7,C1R,701.5518656,1.158092994,0.148994931,7.772700643,7.68E-15,4.79E-13,complement C1r,"Intracellular,Secreted"
+8,LY6E,17380.10811,1.680660696,0.123516876,13.60672927,3.65E-42,6.27E-40,lymphocyte antigen 6 family member E,"Intracellular,Membrane"
+9,IL15RA,291.476414,1.463387386,0.160013956,9.145373459,5.94E-20,4.92E-18,interleukin 15 receptor subunit alpha,"Intracellular,Membrane,Secreted"
+10,IFI30,1231.115371,1.243298171,0.155361184,8.002630654,1.22E-15,8.14E-14,IFI30 lysosomal thiol reductase,"Intracellular,Membrane"
+11,SERPINE1,1111.774873,1.046816407,0.145290613,7.20498309,5.81E-13,3.19E-11,serpin family E member 1,Secreted
+12,LIFR,953.4344261,1.159664081,0.152684966,7.595142528,3.07E-14,1.88E-12,LIF receptor subunit alpha,"Intracellular,Membrane"
+13,CD68,2159.043647,1.292317339,0.161110339,8.021318502,1.05E-15,7.06E-14,CD68 molecule,"Intracellular,Membrane"
