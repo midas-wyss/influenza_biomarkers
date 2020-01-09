@@ -1,0 +1,408 @@
+---
+title: "COPD vs NHB"
+
+author: 
+- Diogo M. Camacho
+- Miguel A. Alcantar
+
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+
+abstract: The goal of this project is to computationally identify biomkarers that validate the efficacy of an in-vitro organ-on-chip model of influenza infection. In particular, we hope to identify biomarkers that capture the idiosyncracies of COPD -- a blanket term used to describe a variety of different lung diseases. Obtaining these biomakers will aid in i) evaluating the model's ability to recapitulate disease physiology ii) identifying novel clinical biomarkers that distinguish influenza from other respiratory diseases and iii) aid in the development of therapeutics tageting influenza. These biomarkers will be recovered from RNA-sequencing data capturing gene expression dynamics in a healthy and infected (influenza) model.  This project is being conducted in collaboration with the Ingber lab and will utilize their acquired RNA-seq data alongside publicly available datasets.
+
+output: html_notebook
+
+---
+
+## Notes
+ - RNA-seq is of lung epithelial cells
+ - there are 5 COPD donors and 4 healthy donors
+ - for most conditions, we have 4hr time points of control vs. virus and 18hr time points of control, poly IC, and virus. Only exception is one healthy donor which only has three 18hr virus replicates and one healthy donor with only four control conditions at 4 hrs
+
+```{r preamble, echo = FALSE}
+# loading packages
+# general packages for data organization and parsing files
+library(tidyverse) # for organizing data structures
+library(readr) # for data parsing / loading in data files
+library(readxl) # for reading Excel files
+library(EnhancedVolcano)
+# library(gdtools)
+
+# differential expression
+library(DESeq2) # differential expression (RNA-seq)
+library(limma, quietly = TRUE) # differential expression (microarray)
+
+# gene database
+library(org.Hs.eg.db) # gene database
+library(DiffNet)
+library(hgu133plus2.db, quietly = TRUE) # human genome
+
+# pathway analysis
+library(pathview)
+library(gage)
+library(gageData)
+library(rpegeos) # created by Diogo (https://rdrr.io/github/diogocamacho/rpegeos/)
+library(ggfortify)
+
+data(kegg.sets.hs) # KEGG pathways
+data(sigmet.idx.hs)
+kegg.sets.hs = kegg.sets.hs[sigmet.idx.hs]
+data(kegg.gs)
+```
+
+```{r data_loader, echo = FALSE}
+source("src/Omics/transcriptomics/util/data_loader.R")
+
+source("src/Omics/transcriptomics/util/diff_expression_pathway_analysis_functions.R") # script for gene- and pathway-level analysis
+
+source("R/stouffer_specificity.R")
+```
+
+
+## Load RNA-seq data
+
+```{r load_data}
+X <- load_data()
+
+count_data <- X$count_data
+gene_ids <- X$gene_ids
+sample_data <- X$metadata # metadata
+
+# final gene count and ID data matrices
+processed_data <- preprocess_data(count_data = count_data, 
+                                  gene_ids = gene_ids, 
+                                  org.Hs.eg.db = org.Hs.eg.db, 
+                                  freq_thresh = 0.50)
+
+count_data<- processed_data$count_data # preprocessed count data 
+gene_ids <- processed_data$gene_ids # genes remaining after preprocessing
+genes_filtered <- processed_data$genes_filtered
+gkey_all <- AnnotationDbi::select(x = org.Hs.eg.db, 
+                                  keys = gene_ids, 
+                                  columns = c("ENTREZID","GENENAME"), 
+                                  keytype = "SYMBOL")  
+
+# write.csv(sample_data_copd_nhb, file = "../../../data/RNA-seq_data_chip/COPD_NHB_data/sample_data_copd_nhb_preprocessed.csv")
+# write.csv(sample_data_copd_nhb, file = "../../../data/RNA-seq_data_chip/COPD_NHB_data/sample_data_copd_nhb_preprocessed.csv")
+# write.csv(gkey_all, 
+#           file = paste0("data/", format(Sys.Date(), "%Y-%m-%d"), "_gkey_all_preprocessed.csv")
+```
+
+## Differential expression
+```{r deseq}
+# differential expression ----
+# use deseq2
+dds_copd_nhb <- DESeqDataSetFromMatrix(countData = count_data,
+                                   colData = sample_data,
+                                   design = ~ condition_group_time)
+
+dds_copd_nhb <- DESeq(object = dds_copd_nhb)
+counts_normalized <- counts(dds_copd_nhb, 
+                            normalized = TRUE) # normalize counts using sizeFactor; useful for GSEA_GAGE
+```
+
+### Comparisons
+```{r diff_comps}
+# regular copd vs control
+# compare basal differences between copd and nhb
+contrast_copd_nhb_contr_4 <- c("condition_group_time", "COPD_control_4", "NHB_control_4")
+contrast_copd_nhb_contr_18 <- c("condition_group_time", "COPD_control_18", "NHB_control_18")
+
+# compare copd patients before and after viral infection
+contrast_copd_v4 <- c("condition_group_time", "COPD_virus_4", "COPD_control_4")
+contrast_copd_v18 <- c("condition_group_time", "COPD_virus_18", "COPD_control_18")
+
+# compare nhb patients before and after viral infection
+contrast_nhb_v4 <- c("condition_group_time", "NHB_virus_4", "NHB_control_4")
+contrast_nhb_v18 <- c("condition_group_time", "NHB_virus_18", "NHB_control_18")
+
+# compare copd and nhb patients with viral infections 
+contrast_copd_nhb_v4 <- c("condition_group_time", "COPD_virus_4", "NHB_virus_4")
+contrast_copd_nhb_v18 <- c("condition_group_time", "COPD_virus_18", "NHB_virus_18")
+
+# compare copd and nhb patients with viral infections 
+contrast_copd_poly_ic18 <- c("condition_group_time", "COPD_poly_ic_18", "COPD_control_18")
+contrast_nhb_poly_icv8 <- c("condition_group_time", "NHB_poly_ic_18", "NHB_control_18")
+
+
+res_copd_nhb_contr4 <- compare_group_DESeq2(dds_copd_nhb, 
+                                            contrast_copd_nhb_contr_4, 
+                                            gene_ids, 
+                                            MHT = "fdr")
+
+res_copd_nhb_contr18<- compare_group_DESeq2(dds_copd_nhb, 
+                                            contrast_copd_nhb_contr_18, 
+                                            gene_ids, 
+                                            MHT = "fdr")
+
+res_copd_v4<- compare_group_DESeq2(dds_copd_nhb, 
+                                   contrast_copd_v4, 
+                                   gene_ids, 
+                                   MHT = "fdr")
+
+res_copd_v18<- compare_group_DESeq2(dds_copd_nhb, 
+                                    contrast_copd_v18, 
+                                    gene_ids, 
+                                    MHT = "fdr")
+
+res_nhb_v4<- compare_group_DESeq2(dds_copd_nhb, 
+                                  contrast_nhb_v4, 
+                                  gene_ids, 
+                                  MHT = "fdr")
+
+res_nhb_v18<- compare_group_DESeq2(dds_copd_nhb, 
+                                   contrast_nhb_v18, 
+                                   gene_ids, 
+                                   MHT = "fdr")
+
+res_copd_nhb_v4<- compare_group_DESeq2(dds_copd_nhb, 
+                                       contrast_copd_nhb_v4, 
+                                       gene_ids, 
+                                       MHT = "fdr")
+
+res_copd_nhb_v18<- compare_group_DESeq2(dds_copd_nhb, 
+                                        contrast_copd_nhb_v18, 
+                                        gene_ids, 
+                                        MHT = "fdr")
+
+res_copd_poly_ic18<- compare_group_DESeq2(dds_copd_nhb, 
+                                          contrast_copd_poly_ic18, 
+                                          gene_ids, 
+                                          MHT = "fdr")
+
+res_nhb_poly_ic18<- compare_group_DESeq2(dds_copd_nhb, 
+                                         contrast_nhb_poly_icv8, 
+                                         gene_ids, 
+                                         MHT = "fdr")
+```
+
+## PCA
+```{r pca}
+count_data_pca <- count_data %>% 
+  t %>%
+  scale %>%
+  as_tibble %>%
+  # as_tibble(scale(t())) %>% 
+  dplyr::mutate(., condition_group_time = sample_data$condition_group_time,
+                condition_group = sample_data$condition_group)
+
+pcs <- prcomp(count_data_pca[, 1:(length(count_data_pca)-2)])$x
+pcs <- pcs %>%
+  as_tibble %>%
+  dplyr::select(., PC1, PC2, PC3) %>%
+  dplyr::mutate(., time = sample_data$time) %>%
+  dplyr::mutate(., condition = sample_data$condition) %>%
+  dplyr::mutate(., group = sample_data$group) %>% 
+  dplyr::mutate(., group_time = sample_data$group_time) %>%
+  dplyr::mutate(., condition_group = sample_data$condition_group) %>%
+  dplyr::mutate(., condition_group_time = sample_data$condition_group_time)
+
+pcs %>%
+  ggplot() + 
+  geom_point(aes(x = PC1, y = PC2, color = condition)) + 
+  scale_fill_viridis_d() +
+  theme_minimal()
+```
+
+
+## Virus specific biomarkers
+```{r virus_biomarkers}
+# viral specific genes
+fold_thr <- 1
+pval_thr <- 0.05
+
+# 4hrs is not interesting, unless 
+virus_sig_nhb_4hrs <- with(res_nhb_v4, 
+                           which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+virus_sig_nhb_18hrs <- with(res_nhb_v18, 
+                            which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+
+virus_sig_copd_4hrs <- with(res_copd_v4, 
+                            which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+virus_sig_copd_18hrs <- with(res_copd_v18, 
+                             which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+
+copd_nhb_diff_sig_4hrs <- with(res_copd_nhb_contr4, 
+                               which(padj < pval_thr & abs(log2FoldChange) > fold_thr))
+copd_nhb_diff_sig18hrs <- with(res_copd_nhb_contr18, 
+                               which(padj < pval_thr & abs(log2FoldChange) > fold_thr))
+
+poly_ic_sig_copd_18hrs <- with(res_copd_poly_ic18, 
+                               which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+poly_ic_sig_nhb_18hrs <- with(res_nhb_poly_ic18, 
+                              which(padj < pval_thr & abs(log2FoldChange) > fold_thr)) 
+
+# write_csv(data.frame(res_nhb_poly_ic18),"test.csv")
+# extracting genes that are differentially expressed in influenza, but not poly-IC challenged models
+virus_specific_nhb_18hrs <- setdiff(virus_sig_nhb_18hrs, poly_ic_sig_nhb_18hrs)
+virus_specific_copd_18hrs <- setdiff(virus_sig_copd_18hrs, poly_ic_sig_copd_18hrs)
+
+virus_specific_copd_v_nhb_18hrs <- setdiff(virus_specific_copd_18hrs,
+                                           virus_specific_nhb_18hrs)
+
+virus_specific_nhb_v_copd_18hrs <- setdiff(virus_specific_nhb_18hrs,
+                                           virus_specific_copd_18hrs)
+
+virus_specific_nhb_genes_18hrs <- gene_ids[virus_specific_nhb_18hrs]
+virus_specific_copd_genes_18hrs <- gene_ids[virus_specific_copd_18hrs]
+
+virus_nhb_genes <- gene_ids[virus_sig_nhb_18hrs]
+virus_copd_genes <-  gene_ids[virus_sig_copd_18hrs]
+virus_copd_nhb_both <- union(virus_nhb_genes, virus_copd_genes)
+polyIC_copd_genes_18hrs <- gene_ids[poly_ic_sig_copd_18hrs]
+polyIC_nhb_genes_18hrs <- gene_ids[poly_ic_sig_nhb_18hrs]
+
+copd_nhb_genes_4hrs <- gene_ids[copd_nhb_diff_sig_4hrs]
+
+copd_specific_virus_genes_18hrs <- gene_ids[virus_specific_copd_v_nhb_18hrs]
+nhb_specific_virus_genes_18hrs <- gene_ids[virus_specific_nhb_v_copd_18hrs]
+copd_diff_genes <- gene_ids[copd_nhb_diff_sig18hrs]
+test2 <- intersect(copd_diff_genes,virus_copd_nhb_both)
+```
+
+
+## Tissue specific biomarkers
+```{r tissue_biomarkers}
+# biogps data ---- tissue and cell expression data
+biogps_data = load_bioGPS()
+
+avg_tissue_exp <- compute_avg_tissue_exp(biogps_data)
+
+stouf_thr <- 3
+num_tissues <- 2
+Z <- stouffer_specificity(expression_data = avg_tissue_exp)
+
+spec_mat <- matrix(0, nrow = nrow(x = Z), ncol = ncol(Z))
+spec_mat[Z >= stouf_thr] <- 1
+spec_genes <- which(rowSums(spec_mat) <= num_tissues)
+lung_genes <- biogps_data$genes$SYMBOL[intersect(which(spec_mat[, 2] == 1), spec_genes)]
+
+# intersect of viral biomarkers and lung specific 
+lung_specific_18h <- tibble::tibble(gene = c(intersect(lung_genes, virus_copd_genes),
+                                         intersect(lung_genes, virus_nhb_genes)),
+                                group = c(rep("copd", length(intersect(lung_genes, virus_copd_genes))),
+                                          rep("nhb", length(intersect(lung_genes, virus_nhb_genes)))))
+
+# lung_flu_nhb_biomarkers_18hrs <- lung_flu_nhb_biomarkers_list_18hrs$lung_spcific
+# lung_nhb_genes_18hrs <- lung_flu_nhb_biomarkers_list_18hrs$lung_genes
+# 
+
+xx <- count_data[which(gene_ids %in% unique(lung_specific$gene)), ]
+zz <- gene_ids[which(gene_ids %in% unique(lung_specific$gene))]
+
+
+# lung_flu_copd_biomarkers_list_18hrs <- lung_specific_biomarkers(avg_tissue_exp, virus_copd_genes,biogps_data, stouf_thr=3, num_tissues=2, output_dir_stouffer)
+# lung_flu_copd_biomarkers_18hrs <- lung_flu_copd_biomarkers_list_18hrs$lung_spcific
+# lung_copd_genes_18hrs <- lung_flu_copd_biomarkers_list_18hrs$lung_genes
+lung_expression <- tibble::tibble(counts = as.vector(as.matrix(xx)),
+                                  gene = rep(zz, ncol(xx)),
+                                  time = as.vector(sapply(sample_data$time, rep, length(zz))),
+                                  group = as.vector(sapply(sample_data$group, rep, length(zz))),
+                                  condition = as.vector(sapply(sample_data$condition, rep, length(zz))),
+                                  group_time = as.vector(sapply(sample_data$group_time, rep, length(zz))),
+                                  condition_group = as.vector(sapply(sample_data$condition_group, rep, length(zz))),
+                                  condition_group_time = as.vector(sapply(sample_data$condition_group_time, rep, length(zz))))
+
+lung_expression %>%
+  dplyr::filter(., time == 18, group != "poly_ic") %>%
+  ggplot() + 
+  geom_boxplot(aes(x = gene, y = counts, fill = group)) + 
+  scale_fill_viridis_d() + 
+  facet_grid(. ~ condition) + 
+  theme_bw() + 
+  theme(panel.grid = element_blank(),
+        plot.background = element_blank(),
+        legend.background = element_blank())
+```
+
+
+## Secreted biomarkers
+```{r secreted_markers}
+#--------------------------------------- Signal peptides / secreted biomarkers
+
+# signal peptides ----
+sig_pep <- read_xlsx("data/secretome/2019-03-07_signal_peptides_human.xlsx")
+
+sig_peps_names <- AnnotationDbi::select(x = org.Hs.eg.db, keys = as.character(sig_pep$`Accession Number`), 
+                                        keytype = "UNIPROT", columns = c("ENTREZID", "SYMBOL"))
+sig_peps_names <- sig_peps_names[which(!is.na(sig_peps_names$ENTREZID)), ]
+
+genes_to_compare <- union(virus_nhb_genes,virus_nhb_genes)
+# differentially abundant signal peptides in our data
+virus_sig_peps_nhb_18 <- intersect(sig_peps_names$SYMBOL, genes_to_compare)
+virus_sig_peps_copd_18 <- intersect(sig_peps_names$SYMBOL, genes_to_compare)
+
+# secreted proteins ----
+# based on HPA predicted data
+hpa_pred <- read_delim("data/secretome/2019-03-07_HPA_predicted_secreted_proteins.tsv", delim = "\t")
+hpa_sec <- hpa_pred[grep("secreted", hpa_pred$`Protein class`), ]
+
+# which virus secreted proteins are differentially abundant 
+virus_secp_nhb_18 <- intersect(hpa_pred$Gene, genes_to_compare)
+virus_secp_copd_18 <- intersect(hpa_pred$Gene, genes_to_compare)
+# predicted secreted biomarkers ----
+virus_biom_sec_nhb_18 <- union(virus_sig_peps_nhb_18, virus_secp_nhb_18)
+virus_biom_sec_copd_18 <- union(virus_sig_peps_copd_18, virus_secp_copd_18)
+
+length(virus_biom_sec_nhb_18)
+length(virus_biom_sec_copd_18)
+
+# virus_biom_sec # proteins that are predicted to be secreted and have signal peptides
+
+# write.table(virus_biom_sec, file="../data/gene_lists/virus_secreted_signal_chip.txt", sep="\t", col.names = F, row.names = F, quote=F)
+# write.table(virus_secp_48hrs, file="../../data/gene_lists/virus_secreted_signal_chip_48hrs.txt", sep="\t", col.names = F, row.names = F, quote=F)
+
+virus_biom_sec_18 <- union(virus_biom_sec_nhb_18, virus_biom_sec_copd_18)
+
+# secreted virus specific ----
+d2_18 <- res_nhb_v18$log2FoldChange[which(gene_ids %in% virus_biom_sec_18)] # <-- chip data
+d3_18 <- res_copd_v18$log2FoldChange[which(gene_ids %in% virus_biom_sec_18)] # <-- chip data
+
+# d4_18<- xx1$logFC[which(G$SYMBOL %in% virus_biom_sec_18)] # <-- zaas data, flu
+# d5_18 <- xx2$logFC[which(G$SYMBOL %in% virus_biom_sec_18)] # <-- zaas data, rsv
+# d6_18 <- xx3$logFC[which(G$SYMBOL %in% virus_biom_sec_18)] # <-- zaas data, hrv
+
+sec_genes_18 <- tibble(group = c(rep("NHB patients", length(d2_18)),
+                                 rep("COPD patients", length(d3_18))),
+                                 # rep("flu infection data (zaas et al)", length(d4_18)),
+                                 # rep("rsv infection data (zaas et al)", length(d5_18)),
+                                 # rep("hrv infection data (zaas et al)", length(d6_18))),
+                       gene_name = c(gene_ids[which(gene_ids %in% virus_biom_sec_18)], 
+                                     gene_ids[which(gene_ids %in% virus_biom_sec_18)]), 
+                                     # G$SYMBOL[which(G$SYMBOL %in% virus_biom_sec_18)],
+                                     # G$SYMBOL[which(G$SYMBOL %in% virus_biom_sec_18)],
+                                     # G$SYMBOL[which(G$SYMBOL %in% virus_biom_sec_18)]),
+                       fold_data = c(d2_18, d3_18))
+# , d4_18, d5_18, d6_18))
+
+sec_genes_18 %>% 
+  ggplot() + 
+  geom_point(aes(x = forcats::fct_reorder(gene_name, fold_data, .desc = TRUE), 
+                 y = fold_data, 
+                 color = group), 
+             size = 7, 
+             alpha = 0.65) + 
+  geom_hline(yintercept = 1, 
+             color = "black", 
+             lty = 2) +
+  geom_hline(yintercept = -1, 
+             color = "black", 
+             lty = 2) +
+  scale_color_viridis_d(name = NULL) + 
+  # scale_color_manual(values = c("purple", "orange")) +
+  labs(x = NULL, y = "log2(fold difference to control)", title = NULL) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 18),
+        axis.text.y = element_text(size = 18),
+        axis.title = element_text(size = 18, color = "black"),
+        panel.grid = element_blank(),
+        legend.position = "bottom", 
+        plot.background = NULL, 
+        panel.background = element_blank(), 
+        legend.background = element_blank(),
+        legend.box.background = element_blank(), 
+        legend.key = element_blank())
+ggsave(filename = paste0("res/", format(Sys.Date(), "%Y-%m-%d"), "_secreted-biomarkers.pdf"),
+       width = 11,
+       height = 8,
+       dpi = 600)
+```
