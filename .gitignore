@@ -1,0 +1,10 @@
+.DS_Store
+
+### R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+## Project files
+data/*
